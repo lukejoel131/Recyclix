@@ -6,6 +6,9 @@
 (define-constant ERR_ALREADY_VERIFIED (err u104))
 (define-constant ERR_NOT_FOUND (err u105))
 (define-constant ERR_INVALID_VERIFIER (err u106))
+(define-constant ERR_LEADERBOARD_NOT_FOUND (err u107))
+(define-constant ERR_ACHIEVEMENT_EXISTS (err u108))
+(define-constant ERR_INVALID_SEASON (err u109))
 
 (define-fungible-token recyclix-token)
 
@@ -48,6 +51,56 @@
 )
 
 (define-data-var next-submission-id uint u1)
+(define-data-var current-season uint u1)
+(define-data-var season-start-block uint u0)
+(define-data-var season-duration uint u1008)
+
+(define-map leaderboard-scores
+  { season: uint, user: principal }
+  {
+    total-score: uint,
+    recycling-streak: uint,
+    material-diversity-count: uint,
+    last-submission-block: uint,
+    rank-position: uint
+  }
+)
+
+(define-map season-leaderboard
+  { season: uint, position: uint }
+  {
+    user: principal,
+    score: uint
+  }
+)
+
+(define-map user-achievements
+  { user: principal, achievement-id: uint }
+  {
+    unlocked-at-block: uint,
+    season-earned: uint
+  }
+)
+
+(define-map achievement-definitions
+  { achievement-id: uint }
+  {
+    name: (string-ascii 50),
+    description: (string-ascii 100),
+    score-threshold: uint,
+    badge-type: (string-ascii 20)
+  }
+)
+
+(define-map material-streaks
+  { user: principal }
+  {
+    current-streak: uint,
+    max-streak: uint,
+    last-submission-block: uint,
+    materials-used: (list 10 (string-ascii 20))
+  }
+)
 
 (define-private (is-authorized-verifier (verifier principal))
   (default-to false (get active (map-get? authorized-verifiers { verifier: verifier })))
@@ -79,16 +132,124 @@
   )
 )
 
+(define-private (calculate-user-score (user principal))
+  (let ((stats (default-to 
+          { total-submissions: u0, total-weight: u0, total-tokens-earned: u0, verified-submissions: u0 }
+          (map-get? user-stats { user: user })))
+        (streak-data (default-to 
+          { current-streak: u0, max-streak: u0, last-submission-block: u0, materials-used: (list) }
+          (map-get? material-streaks { user: user }))))
+    (+ 
+      (* (get verified-submissions stats) u100)
+      (* (get total-weight stats) u10)
+      (* (get max-streak streak-data) u200)
+      (* (len (get materials-used streak-data)) u150)
+    )
+  )
+)
+
+(define-private (update-material-streak (user principal) (material-type (string-ascii 20)))
+  (let ((current-streak (default-to 
+          { current-streak: u0, max-streak: u0, last-submission-block: u0, materials-used: (list) }
+          (map-get? material-streaks { user: user })))
+        (current-block stacks-block-height)
+        (last-block (get last-submission-block current-streak)))
+    (let ((is-consecutive (or (is-eq last-block u0) (<= (- current-block last-block) u144)))
+          (new-streak (if is-consecutive (+ (get current-streak current-streak) u1) u1))
+          (new-max (if (> new-streak (get max-streak current-streak)) new-streak (get max-streak current-streak)))
+          (updated-materials (if (is-none (index-of (get materials-used current-streak) material-type))
+                                (unwrap-panic (as-max-len? (append (get materials-used current-streak) material-type) u10))
+                                (get materials-used current-streak))))
+      (map-set material-streaks
+        { user: user }
+        {
+          current-streak: new-streak,
+          max-streak: new-max,
+          last-submission-block: current-block,
+          materials-used: updated-materials
+        }
+      )
+    )
+  )
+)
+
+(define-private (update-leaderboard-score (user principal))
+  (let ((active-season (var-get current-season))
+        (user-score (calculate-user-score user))
+        (existing-score (default-to 
+          { total-score: u0, recycling-streak: u0, material-diversity-count: u0, last-submission-block: u0, rank-position: u0 }
+          (map-get? leaderboard-scores { season: active-season, user: user })))
+        (streak-data (default-to 
+          { current-streak: u0, max-streak: u0, last-submission-block: u0, materials-used: (list) }
+          (map-get? material-streaks { user: user }))))
+    (map-set leaderboard-scores
+      { season: active-season, user: user }
+      {
+        total-score: user-score,
+        recycling-streak: (get current-streak streak-data),
+        material-diversity-count: (len (get materials-used streak-data)),
+        last-submission-block: stacks-block-height,
+        rank-position: (get rank-position existing-score)
+      }
+    )
+  )
+)
+
+(define-private (check-achievements (user principal))
+  (let ((user-score (calculate-user-score user)))
+    (begin
+      (if (>= user-score u1000)
+        (unwrap-panic (unlock-achievement user u1))
+        true
+      )
+      (if (>= user-score u5000)
+        (unwrap-panic (unlock-achievement user u2))
+        true
+      )
+      (if (>= user-score u10000)
+        (unwrap-panic (unlock-achievement user u3))
+        true
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-private (unlock-achievement (user principal) (achievement-id uint))
+  (let ((existing (map-get? user-achievements { user: user, achievement-id: achievement-id })))
+    (if (is-none existing)
+      (begin
+        (map-set user-achievements
+          { user: user, achievement-id: achievement-id }
+          {
+            unlocked-at-block: stacks-block-height,
+            season-earned: (var-get current-season)
+          }
+        )
+        (ok true)
+      )
+      (ok true)
+    )
+  )
+)
+
 (define-public (initialize-contract)
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
     (try! (ft-mint? recyclix-token u1000000000000 CONTRACT_OWNER))
     (var-set total-supply u1000000000000)
+    (var-set season-start-block stacks-block-height)
     (map-set material-rates { material-type: "plastic" } { rate-per-kg: u100 })
     (map-set material-rates { material-type: "glass" } { rate-per-kg: u150 })
     (map-set material-rates { material-type: "metal" } { rate-per-kg: u200 })
     (map-set material-rates { material-type: "paper" } { rate-per-kg: u75 })
     (map-set material-rates { material-type: "electronics" } { rate-per-kg: u500 })
+    (map-set achievement-definitions { achievement-id: u1 } 
+      { name: "Recycling Novice", description: "Complete your first 1000 points worth of recycling activities", score-threshold: u1000, badge-type: "bronze" })
+    (map-set achievement-definitions { achievement-id: u2 } 
+      { name: "Eco Warrior", description: "Achieve 5000 points through consistent recycling efforts", score-threshold: u5000, badge-type: "silver" })
+    (map-set achievement-definitions { achievement-id: u3 } 
+      { name: "Green Champion", description: "Reach 10000 points demonstrating recycling mastery", score-threshold: u10000, badge-type: "gold" })
     (ok true)
   )
 )
@@ -163,6 +324,9 @@
       )
       
       (update-user-stats user u0 tokens-to-mint true)
+      (update-material-streak user (get material-type submission))
+      (update-leaderboard-score user)
+      (unwrap-panic (check-achievements user))
       (ok tokens-to-mint)
     )
   )
@@ -206,4 +370,79 @@
 
 (define-read-only (get-next-submission-id)
   (var-get next-submission-id)
+)
+
+(define-public (start-new-season)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (let ((current-block stacks-block-height)
+          (season-start (var-get season-start-block))
+          (duration (var-get season-duration)))
+      (asserts! (>= (- current-block season-start) duration) ERR_INVALID_SEASON)
+      (var-set current-season (+ (var-get current-season) u1))
+      (var-set season-start-block current-block)
+      (ok (var-get current-season))
+    )
+  )
+)
+
+(define-public (update-leaderboard-rankings)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (ok true)
+  )
+)
+
+(define-read-only (get-leaderboard-position (season uint) (position uint))
+  (map-get? season-leaderboard { season: season, position: position })
+)
+
+(define-read-only (get-user-leaderboard-score (season uint) (user principal))
+  (map-get? leaderboard-scores { season: season, user: user })
+)
+
+(define-read-only (get-user-achievements (user principal))
+  (let ((achievement-1 (map-get? user-achievements { user: user, achievement-id: u1 }))
+        (achievement-2 (map-get? user-achievements { user: user, achievement-id: u2 }))
+        (achievement-3 (map-get? user-achievements { user: user, achievement-id: u3 })))
+    {
+      bronze-badge: achievement-1,
+      silver-badge: achievement-2,
+      gold-badge: achievement-3
+    }
+  )
+)
+
+(define-read-only (get-achievement-definition (achievement-id uint))
+  (map-get? achievement-definitions { achievement-id: achievement-id })
+)
+
+(define-read-only (get-user-streak-data (user principal))
+  (map-get? material-streaks { user: user })
+)
+
+(define-read-only (get-current-season-info)
+  {
+    current-season: (var-get current-season),
+    season-start-block: (var-get season-start-block),
+    season-duration: (var-get season-duration),
+    blocks-remaining: (- (+ (var-get season-start-block) (var-get season-duration)) stacks-block-height)
+  }
+)
+
+(define-read-only (get-user-performance-stats (user principal))
+  (let ((stats (default-to 
+          { total-submissions: u0, total-weight: u0, total-tokens-earned: u0, verified-submissions: u0 }
+          (map-get? user-stats { user: user })))
+        (streak-data (default-to 
+          { current-streak: u0, max-streak: u0, last-submission-block: u0, materials-used: (list) }
+          (map-get? material-streaks { user: user })))
+        (score (calculate-user-score user)))
+    (merge stats {
+      current-score: score,
+      recycling-streak: (get current-streak streak-data),
+      max-streak: (get max-streak streak-data),
+      materials-recycled: (len (get materials-used streak-data))
+    })
+  )
 )
