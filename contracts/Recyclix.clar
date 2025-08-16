@@ -9,8 +9,15 @@
 (define-constant ERR_LEADERBOARD_NOT_FOUND (err u107))
 (define-constant ERR_ACHIEVEMENT_EXISTS (err u108))
 (define-constant ERR_INVALID_SEASON (err u109))
+(define-constant ERR_INSUFFICIENT_TOKENS (err u110))
+(define-constant ERR_INVALID_CREDIT_AMOUNT (err u111))
+(define-constant ERR_TRADE_NOT_FOUND (err u112))
+(define-constant ERR_TRADE_EXPIRED (err u113))
+(define-constant ERR_CANNOT_BUY_OWN_TRADE (err u114))
+(define-constant ERR_CERTIFICATE_NOT_FOUND (err u115))
 
 (define-fungible-token recyclix-token)
+(define-fungible-token carbon-credit)
 
 (define-data-var token-name (string-ascii 32) "Recyclix Token")
 (define-data-var token-symbol (string-ascii 10) "RCX")
@@ -54,6 +61,9 @@
 (define-data-var current-season uint u1)
 (define-data-var season-start-block uint u0)
 (define-data-var season-duration uint u1008)
+(define-data-var token-to-credit-rate uint u10)
+(define-data-var next-trade-id uint u1)
+(define-data-var next-certificate-id uint u1)
 
 (define-map leaderboard-scores
   { season: uint, user: principal }
@@ -99,6 +109,38 @@
     max-streak: uint,
     last-submission-block: uint,
     materials-used: (list 10 (string-ascii 20))
+  }
+)
+
+;; Carbon credit marketplace data structures
+(define-map carbon-trades
+  { trade-id: uint }
+  {
+    seller: principal,
+    credits-amount: uint,
+    price-per-credit: uint,
+    expires-at-block: uint,
+    active: bool
+  }
+)
+
+(define-map carbon-certificates
+  { certificate-id: uint }
+  {
+    owner: principal,
+    credits-offset: uint,
+    generated-at-block: uint,
+    purpose: (string-ascii 100),
+    verified: bool
+  }
+)
+
+(define-map carbon-conversions
+  { user: principal }
+  {
+    total-tokens-converted: uint,
+    total-credits-generated: uint,
+    last-conversion-block: uint
   }
 )
 
@@ -230,6 +272,149 @@
       )
       (ok true)
     )
+  )
+)
+
+;; Carbon credit conversion and trading functions
+(define-private (update-conversion-stats (user principal) (tokens-amount uint) (credits-amount uint))
+  (let ((existing (default-to 
+          { total-tokens-converted: u0, total-credits-generated: u0, last-conversion-block: u0 }
+          (map-get? carbon-conversions { user: user }))))
+    (map-set carbon-conversions
+      { user: user }
+      {
+        total-tokens-converted: (+ (get total-tokens-converted existing) tokens-amount),
+        total-credits-generated: (+ (get total-credits-generated existing) credits-amount),
+        last-conversion-block: stacks-block-height
+      }
+    )
+  )
+)
+
+(define-public (convert-tokens-to-credits (token-amount uint))
+  (let ((conversion-rate (var-get token-to-credit-rate))
+        (credits-to-mint (/ token-amount conversion-rate)))
+    (asserts! (> token-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= (ft-get-balance recyclix-token tx-sender) token-amount) ERR_INSUFFICIENT_TOKENS)
+    (asserts! (> credits-to-mint u0) ERR_INVALID_CREDIT_AMOUNT)
+    
+    ;; Burn recyclix tokens and mint carbon credits
+    (try! (ft-burn? recyclix-token token-amount tx-sender))
+    (try! (ft-mint? carbon-credit credits-to-mint tx-sender))
+    
+    ;; Update conversion statistics
+    (update-conversion-stats tx-sender token-amount credits-to-mint)
+    
+    (ok credits-to-mint)
+  )
+)
+
+(define-public (create-carbon-trade (credits-amount uint) (price-per-credit uint) (duration-blocks uint))
+  (let ((trade-id (var-get next-trade-id))
+        (expires-at (+ stacks-block-height duration-blocks)))
+    (asserts! (> credits-amount u0) ERR_INVALID_CREDIT_AMOUNT)
+    (asserts! (> price-per-credit u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= (ft-get-balance carbon-credit tx-sender) credits-amount) ERR_INSUFFICIENT_TOKENS)
+    
+    ;; Escrow the carbon credits
+    (try! (ft-transfer? carbon-credit credits-amount tx-sender (as-contract tx-sender)))
+    
+    ;; Create trade listing
+    (map-set carbon-trades
+      { trade-id: trade-id }
+      {
+        seller: tx-sender,
+        credits-amount: credits-amount,
+        price-per-credit: price-per-credit,
+        expires-at-block: expires-at,
+        active: true
+      }
+    )
+    
+    (var-set next-trade-id (+ trade-id u1))
+    (ok trade-id)
+  )
+)
+
+(define-public (buy-carbon-credits (trade-id uint))
+  (let ((trade (unwrap! (map-get? carbon-trades { trade-id: trade-id }) ERR_TRADE_NOT_FOUND)))
+    (asserts! (get active trade) ERR_TRADE_NOT_FOUND)
+    (asserts! (<= stacks-block-height (get expires-at-block trade)) ERR_TRADE_EXPIRED)
+    (asserts! (not (is-eq tx-sender (get seller trade))) ERR_CANNOT_BUY_OWN_TRADE)
+    
+    (let ((total-cost (* (get credits-amount trade) (get price-per-credit trade)))
+          (seller (get seller trade))
+          (credits-amount (get credits-amount trade))
+          (buyer tx-sender))
+      
+      (asserts! (>= (ft-get-balance recyclix-token tx-sender) total-cost) ERR_INSUFFICIENT_TOKENS)
+      
+      ;; Transfer payment to seller
+      (try! (ft-transfer? recyclix-token total-cost tx-sender seller))
+      
+      ;; Transfer carbon credits to buyer
+      (try! (as-contract (ft-transfer? carbon-credit credits-amount tx-sender buyer)))
+      
+      ;; Mark trade as inactive
+      (map-set carbon-trades
+        { trade-id: trade-id }
+        (merge trade { active: false })
+      )
+      
+      (ok credits-amount)
+    )
+  )
+)
+
+(define-public (cancel-carbon-trade (trade-id uint))
+  (let ((trade (unwrap! (map-get? carbon-trades { trade-id: trade-id }) ERR_TRADE_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get seller trade)) ERR_UNAUTHORIZED)
+    (asserts! (get active trade) ERR_TRADE_NOT_FOUND)
+    
+    ;; Return escrowed credits to seller
+    (try! (as-contract (ft-transfer? carbon-credit (get credits-amount trade) tx-sender (get seller trade))))
+    
+    ;; Mark trade as inactive
+    (map-set carbon-trades
+      { trade-id: trade-id }
+      (merge trade { active: false })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (generate-carbon-certificate (credits-to-offset uint) (purpose (string-ascii 100)))
+  (let ((certificate-id (var-get next-certificate-id)))
+    (asserts! (> credits-to-offset u0) ERR_INVALID_CREDIT_AMOUNT)
+    (asserts! (>= (ft-get-balance carbon-credit tx-sender) credits-to-offset) ERR_INSUFFICIENT_TOKENS)
+    
+    ;; Burn carbon credits for permanent offset
+    (try! (ft-burn? carbon-credit credits-to-offset tx-sender))
+    
+    ;; Generate certificate
+    (map-set carbon-certificates
+      { certificate-id: certificate-id }
+      {
+        owner: tx-sender,
+        credits-offset: credits-to-offset,
+        generated-at-block: stacks-block-height,
+        purpose: purpose,
+        verified: true
+      }
+    )
+    
+    (var-set next-certificate-id (+ certificate-id u1))
+    (ok certificate-id)
+  )
+)
+
+(define-public (set-conversion-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> new-rate u0) ERR_INVALID_AMOUNT)
+    (var-set token-to-credit-rate new-rate)
+    (ok true)
   )
 )
 
@@ -446,3 +631,40 @@
     })
   )
 )
+
+;; Carbon credit system read-only functions
+(define-read-only (get-carbon-credit-balance (user principal))
+  (ft-get-balance carbon-credit user)
+)
+
+(define-read-only (get-conversion-rate)
+  (var-get token-to-credit-rate)
+)
+
+(define-read-only (get-carbon-trade (trade-id uint))
+  (map-get? carbon-trades { trade-id: trade-id })
+)
+
+(define-read-only (get-carbon-certificate (certificate-id uint))
+  (map-get? carbon-certificates { certificate-id: certificate-id })
+)
+
+(define-read-only (get-user-conversion-stats (user principal))
+  (map-get? carbon-conversions { user: user })
+)
+
+(define-read-only (get-active-trades-count)
+  (var-get next-trade-id)
+)
+
+(define-read-only (get-total-certificates-issued)
+  (var-get next-certificate-id)
+)
+
+(define-read-only (calculate-carbon-impact (token-amount uint))
+  (let ((conversion-rate (var-get token-to-credit-rate)))
+    (/ token-amount conversion-rate)
+  )
+)
+
+
